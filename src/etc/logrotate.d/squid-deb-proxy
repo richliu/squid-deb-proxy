@@ -1,0 +1,22 @@
+#
+# Logrotate fragment for squid-deb-proxy.
+#
+/var/log/squid-deb-proxy/*.log {
+ daily
+ compress
+ delaycompress
+ rotate 2
+ missingok
+ nocreate
+ sharedscripts
+ postrotate
+  if [ -x /usr/sbin/squid ]; then
+      SQUID=/usr/sbin/squid
+  else
+      echo "No squid binary found"
+      exit 1
+  fi
+
+  test ! -e /var/run/squid-deb-proxy.pid || $SQUID -f /etc/squid-deb-proxy/squid-deb-proxy.conf -k rotate
+ endscript
+}
