@@ -1,141 +1,172 @@
-#! /bin/sh
-#
-# squid-deb-proxy		Startup script for the SQUID Deb HTTP proxy-cache.
-#
-# Version:	@(#)squid-deb-proxy.rc  1.0  12-Mar-2011  andrew.simpson@corokia.co.nz
-#
-### BEGIN INIT INFO
-# Provides:          squid-deb-proxy
-# Required-Start:    $network $remote_fs $syslog
-# Required-Stop:     $network $remote_fs $syslog
-# Should-Start:      $named
-# Should-Stop:       $named
-# Default-Start:     2 3 4 5
-# Default-Stop:      0 1 6
-# Short-Description: Squid Deb Package HTTP Proxy
-### END INIT INFO
+#!/sbin/openrc-run
+# Copyright 1999-2019 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
 
-NAME=squid-deb-proxy
-DESC="Squid Deb HTTP Proxy"
-DAEMON=/usr/sbin/squid
-PIDFILE=/var/run/$NAME.pid
-CONFIG=/etc/squid-deb-proxy/squid-deb-proxy.conf
-SQUID_ARGS="-YC -f $CONFIG"
+SQUID_SVCNAME=$( echo "${RC_SVCNAME}" | tr -cd '[a-zA-Z0-9]' )
 
-[ ! -f /etc/default/squid-deb-proxy ] || . /etc/default/squid-deb-proxy
+extra_started_commands="reload rotate"
 
-. /lib/lsb/init-functions
+depend() {
+	use dns net
+}
 
-# get the common stuff
 . /usr/share/squid-deb-proxy/init-common.sh
 
-PATH=/bin:/usr/bin:/sbin:/usr/sbin
+checkconfig() {
+	local CONFFILES="/etc/squid-deb-proxy/${RC_SVCNAME}.conf"
+	if [ ! -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf ]; then
+		eerror "You need to create /etc/squid-deb-proxy/${RC_SVCNAME}.conf first."
+		eerror "The main configuration file and all included file names should have the following format:"
+		eerror "${CONFFILES}"
+		eerror "An example can be found in /etc/squid-deb-proxy/squid-deb-proxy.conf.default"
+		return 1
+	fi
 
-[ -x $DAEMON ] || exit 0
+	local PIDFILE=$(cat ${CONFFILES} 2>/dev/null 3>/dev/null | awk '/^[ \t]*pid_filename[ \t]+/ { print $2 }')
+	[ -z ${PIDFILE} ] && PIDFILE=/var/run/squid.pid
+	if [ /var/run/${RC_SVCNAME}.pid != ${PIDFILE} ]; then
+		eerror "/etc/squid-deb-proxy/${RC_SVCNAME}.conf must set pid_filename to"
+		eerror "   /var/run/${RC_SVCNAME}.pid"
+		eerror "CAUTION: http_port, cache_dir and *_log parameters must be different than"
+		eerror "         in any other instance of squid."
+		eerror "Make sure the main configuration file and all included file names have the following format:"
+		eerror "${CONFFILES}"
+		return 1
+	fi
 
-ulimit -n 65535
+	# Maximum file descriptors squid can open is determined by:
+	# a basic default of N=1024
+	#  ... altered by ./configure --with-filedescriptors=N
+	#  ... overridden on production by squid.conf max_filedescriptors (if,
+	#  and only if, setrlimit() RLIMIT_NOFILE is able to be built+used).
+	# Since we do not configure hard coded # of filedescriptors anymore,
+	# there is no need for ulimit calls in the init script.
+	# Use max_filedescriptors in squid.conf instead.
 
-start () {
-        cache_dir=`find_cache_dir cache_dir`
-        pre_start
+	local CACHE_SWAP=$(cat ${CONFFILES} 2>/dev/null 3>/dev/null | awk '/^[ \t]*cache_dir[ \t]+/ { if ( $2 == "rock" ) printf "%s/rock ", $3; else if ( $2 == "coss" ) printf "%s/stripe ", $3; else printf "%s/00 ", $3; }')
+	[ -z "$CACHE_SWAP" ] && CACHE_SWAP="/var/cache/squid-deb-proxy/00"
 
-	umask 027
-	ulimit -n 65535
-	cd $cache_dir
-	start-stop-daemon --quiet --start \
-		--pidfile $PIDFILE \
-		--exec $DAEMON -- $SQUID_ARGS < /dev/null
-	status=$?
-	if [ $status -eq 0 ]
-	then
-	        post_start
-	fi 
-	return $status
-}
+	local x
+	for x in $CACHE_SWAP ; do
+		if [ ! -e $x ] ; then
+			ebegin "Initializing cache directory ${x%/*}"
+			local ORIG_UMASK=$(umask)
+			umask 027
 
-stop () {
-	PID=`cat $PIDFILE 2>/dev/null`
-	start-stop-daemon --stop --quiet \
-		--pidfile $PIDFILE \
-		--exec $DAEMON
-
-        # cleanup
-        post_stop
-
-	#
-	#	Now we have to wait until squid has _really_ stopped.
-	#
-	sleep 2
-	if test -n "$PID" && kill -0 $PID 2>/dev/null
-	then
-		log_action_begin_msg " Waiting"
-		cnt=0
-		while kill -0 $PID 2>/dev/null
-		do
-			cnt=`expr $cnt + 1`
-			if [ $cnt -gt 24 ]
-			then
-				log_action_end_msg 1
+			if ! (mkdir -p ${x%/*} && chown squid ${x%/*}) ; then
+				eend 1
 				return 1
 			fi
-			sleep 5
-			log_action_cont_msg ""
-		done
-		log_action_end_msg 0
-		return 0
-	else
-		return 0
-	fi
+
+			local INIT_CACHE_RESPONSE="$(/usr/sbin/squid -z -N -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME} 2>&1)"
+			if [ $? != 0 ] || echo "$INIT_CACHE_RESPONSE" | grep -q "erminated abnormally" ; then
+				umask $ORIG_UMASK
+				eend 1
+				echo "$INIT_CACHE_RESPONSE"
+				return 1
+			fi
+
+			umask $ORIG_UMASK
+			eend 0
+			break
+		fi
+	done
+
+	return 0
 }
 
-case "$1" in
-	start)
-	log_daemon_msg "Starting $DESC" "$NAME"
-	if start ; then
-		log_end_msg $?
+concat_file_from_dir() {
+      # the .d directory
+      DIR="$1"
+      # the target file
+      FILE="$2"
+      # (optional) additional file append to $FILE
+      ADDITIONAL_FILE_TO_CAT="$3"
+      cat > $FILE <<EOF
+# WARNING: this file is auto-generated from the files in
+#          $DIR
+#          on squid-deb-proxy (re)start, do NOT edit here
+EOF
+      if [ -n "$ADDITIONAL_FILE_TO_CAT" ]; then
+          cat "$ADDITIONAL_FILE_TO_CAT" >> "$FILE"
+      fi
+
+      for f in "$DIR"/*; do
+          cat "$f" >> "$FILE"
+      done
+}
+
+
+start() {
+	checkconfig || return 1
+	checkpath -d -q -m 0750 -o squid:squid /var/run/${RC_SVCNAME}
+	checkpath -d -q -m 0750 -o squid:squid /var/log/${RC_SVCNAME}
+
+	# generate pkg blacklist acl file
+	PKG_BLACKLIST_DIR=/etc/squid-deb-proxy/pkg-blacklist.d
+	PKG_BLACKLIST=/etc/squid-deb-proxy/autogenerated/pkg-blacklist-regexp.acl
+	concat_file_from_dir "$PKG_BLACKLIST_DIR" "$PKG_BLACKLIST"
+	# postprocess for regexp format
+	sed -i -r '/^#/d;/^$/d;s#(.*)#\/\1_.*\.deb$#g' $PKG_BLACKLIST
+
+	# generate mirror file
+	MIRROR_DESTDOMAIN_DIR=/etc/squid-deb-proxy/mirror-dstdomain.acl.d
+	MIRROR_DESTDOMAIN=/etc/squid-deb-proxy/autogenerated/mirror-dstdomain.acl
+	concat_file_from_dir "$MIRROR_DESTDOMAIN_DIR" "$MIRROR_DESTDOMAIN" "/etc/squid-deb-proxy/mirror-dstdomain.acl"
+
+	# generate the allowed-networks file
+	ALLOWED_NETWORKS_DIR=/etc/squid-deb-proxy/allowed-networks-src.acl.d
+	ALLOWED_NETWORKS=/etc/squid-deb-proxy/autogenerated/allowed-networks-src.acl
+	concat_file_from_dir "$ALLOWED_NETWORKS_DIR" "$ALLOWED_NETWORKS" "/etc/squid-deb-proxy/allowed-networks-src.acl"
+
+
+	# see https://wiki.squid-cache.org/MultipleInstances
+	ebegin "Starting ${RC_SVCNAME} (service name ${SQUID_SVCNAME}) with KRB5_KTNAME=\"${SQUID_KEYTAB}\" /usr/sbin/squid ${SQUID_OPTS} -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}"
+	KRB5_KTNAME="${SQUID_KEYTAB}" /usr/sbin/squid ${SQUID_OPTS} -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}
+	eend $? && sleep 1
+}
+
+stop() {
+	ebegin "Stopping ${RC_SVCNAME} with /usr/sbin/squid -k shutdown -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}"
+	if /usr/sbin/squid -k shutdown -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME} ; then
+		if [ "x${SQUID_FAST_SHUTDOWN}" = "xyes" ]; then
+			einfo "Attempting fast shutdown."
+			/usr/sbin/squid -k shutdown -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}
+		fi
+		# Now we have to wait until squid has _really_ stopped.
+		sleep 1
+		if [ -f /var/run/${RC_SVCNAME}.pid ] ; then
+			einfon "Waiting for squid to shutdown ."
+			cnt=0
+			while [ -f /var/run/${RC_SVCNAME}.pid ] ; do
+				cnt=$(expr $cnt + 1)
+				if [ $cnt -gt 60 ] ; then
+					# Waited 120 seconds now. Fail.
+					echo
+					eend 1 "Failed."
+					break
+				fi
+				sleep 2
+				printf "."
+			done
+			echo
+		fi
 	else
-		log_end_msg $?
+		eerror "Squid shutdown failed, probably service is already down."
 	fi
-	;;
+	eend 0
+}
 
-	stop)
-	log_daemon_msg "Stopping $DESC" "$NAME"
-	if stop ; then
-		log_end_msg $?
-	else
-		log_end_msg $?
-	fi
-	;;
+reload() {
+	checkconfig || return 1
+	ebegin "Reloading ${RC_SVCNAME} with /usr/sbin/squid -k reconfigure -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}"
+	/usr/sbin/squid -k reconfigure -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}
+	eend $?
+}
 
-	reload|force-reload)
-	log_action_msg "Reloading $DESC configuration files"
-        # this will stop avahi
-        post_stop
-        # ensure that the auto-generated files are updated on reload
-        pre_start
-        # and reload
-	start-stop-daemon --stop --signal 1 --quiet \
-		--pidfile $PIDFILE --exec $DAEMON -- -f $CONFIG
-	log_action_end_msg 0
-        # this will start avahi again
-        post_start
-	;;
-
-	restart)
-	log_daemon_msg "Restarting $DESC" "$NAME"
-	stop
-	if start ; then
-		log_end_msg $?
-	else
-		log_end_msg $?
-	fi
-	;;
-
-	*)
-	echo "Usage: /etc/init.d/$NAME {start|stop|reload|force-reload|restart}"
-	exit 3
-	;;
-esac
-
-exit 0
-
+rotate() {
+	service_started ${RC_SVCNAME} || return 1
+	ebegin "Rotating ${RC_SVCNAME} logs with /usr/sbin/squid -k rotate -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}"
+	/usr/sbin/squid -k rotate -f /etc/squid-deb-proxy/${RC_SVCNAME}.conf -n ${SQUID_SVCNAME}
+	eend $?
+}
